@@ -1,0 +1,3349 @@
+#+PROPERTY: header-args:python :exports code :eval no
+#+PROPERTY: header-args:R :exports code :eval no
+** Images
+
+First step is to get a small sample of the images (the whole thing takes forever to download).
+
+#+BEGIN_SRC R :session :results none
+photos <- rentals$photos
+set.seed(11)
+sample <- sample(1:length(photos), size=5000)
+sample_for_photos <- rentals[sample,]
+saveRDS(sample_for_photos, file="photos_sample.rds")
+photo_urls <- sample_for_photos$photos
+
+    dir.create("photos_sample")
+#+END_SRC
+
+#+BEGIN_SRC R :session :tangle get_photos.R
+#!/usr/bin/env Rscript
+messagedf <- list()
+warningvec <- list()
+get_one_photo <- function(url) {
+    name <- gsub(".*/([A-Za-z0-9_]+.jpg)", "\\1", x=url)
+    download.file(url, destfile =name, mode="wb" )
+}
+get_some_photos <- function(list, id, folder) {
+
+        for (i in 1:length(list)) {
+            nam <- paste0(folder, "/", id, "-", i, ".jpg")
+            get_one_photo(list[i])
+        }
+}
+#+END_SRC
+
+#+RESULTS:
+
+So that all appears to work.
+
+Let's do it on all of the images, so we have something to work with in PyTorch.
+
+#+BEGIN_SRC R :session :results none
+stupid_loop <- function(data) {
+    for(j in 1:nrow(data)) {
+        if(length(data$photos[[j]])==0) {
+            next
+        }
+        else {
+            get_some_photos(unlist(data$photos[j]), id=data$listing_id[j], folder="photos_sample")
+        }
+    }
+
+}
+#+END_SRC
+
+So some of these calls will fail, and I need to handle these errors.
+tryCatch provides a method of doing so. The basic call is as follows:
+
+#+BEGIN_SRC R :session :exports code
+message_handler <- function(m) message(m)
+warning_handler <- function(w) warning(w)
+error_handler <- function(e) simpleError(message="simple error", call=e)
+ok_res <- tryCatch(expr=1+1,
+         message=message_handler,
+         warning=warning_handler,
+         error=error_handler)
+
+warning_res <- tryCatch(expr=as.integer(2^32+2^33),
+         message=message_handler,
+         warning=warning_handler,
+         error=error_handler)
+
+error_res <- tryCatch(expr=1+a,
+         message=message_handler,
+         warning=warning_handler,
+         error=error_handler)
+
+
+#+END_SRC
+
+So that's the basic structure needed.
+The next step is to actually take some action based on the condition.
+One useful thing to do would be to log the problems (or success).
+We can do this using the logging package.
+This package is set up as follows.
+#+BEGIN_SRC R :session :results none
+require(logging)
+basicConfig()
+#+END_SRC
+
+Then, one can pepper logging calls throughout the code like so
+#+BEGIN_SRC R :session
+loginfo("something happened")
+logwarn("something worse happened")
+logerror("this is messed up")
+#+END_SRC
+
+But we must remember that I am a very lazy person, and adding logging code to each of my functions, while easy, offends my sensibilities. Therefore I will choose a much less understandable way to achieve this aim.
+
+Next step, closures.
+
+#+BEGIN_SRC R :session :results none
+with_log <- function(f, ...) {
+        f <- tryCatch(f(...))
+        if (message(f)) {
+            logger::loginfo(f)
+        }
+        if (warning(f)) {
+            logger::logwarn(f)
+        }
+        if (error(f)) {
+            logger::logerror(f)
+        }
+        else {
+            f
+        }})
+    }
+
+#+END_SRC
+
+This is cool, but complicated and unnecessary. Let's just handle errors.
+I need to handle errors, log the URL to a file and try again later.
+
+So, R's error handling mechanisms involve conditions. Here's a function to create one.
+
+#+BEGIN_SRC R :session
+condition <- function(subclass, message, call = sys.call(-1), ...) {
+  structure(
+    class = c(subclass, "condition"),
+    list(message = message, call = call, ...)
+  )
+}
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC R :session
+handle_error <- function(e, call) {
+    if(!exists(err)) {
+        err <<- 1
+    }
+    else {
+        err <<- err + 1
+    }
+    code <- httr::status_code()
+    if(code>=400 && <=499) {
+        message("client error")
+    }
+    if(code>=500) {
+        message("server error")
+    }
+    invokeRestart()
+}
+#+END_SRC
+
+So really all I need to do is create an error function that just skips the offending URL, and logs it to an object which is written to during a finally block.
+
+#+BEGIN_SRC R :session
+skip_url <- function() invokeRestart("skip_url")
+tryCatch(
+    expr=stupid_loop(sample_for_photos),
+    error=function(e) message(e)
+    )
+#+END_SRC
+** Actual Code for Getting Photos
+
+- (Stolen from Debugging.org)
+#+BEGIN_SRC R :session :results none :tangle get_photos.R
+
+log_results <- function(e) {
+    if(!exists("num_processed")) {
+        num_processed <<- 1
+    }
+    else {
+        num_processed <<- num_processed + 1
+    }
+    if(!exists("messagedf")) {
+        messagedf <<- vector(mode="list", length=1)
+    }
+    else {
+        messagedf <<- c(messagedf, e)
+    }}
+#+END_SRC
+- We will log each URL processed
+- We can also log the number of URLs processed (just because, I guess)
+- Note the (normally a bad idea) use of global variables (*<<-*)
+
+* Warnings
+
+#+BEGIN_SRC R :session :results none :exports code :tangle get_photos.R
+handle_warnings <- function(e) {
+    message(e)
+    if(!exists("warning_vec")) {
+        warning_vec <<- e
+    }
+    else {
+        warning_vec <<- c(warning_vec, e)
+
+    }
+
+}
+#+END_SRC
+
+
+
+#+BEGIN_SRC R :session :tangle get_photos.R
+get_all_photos <- function(data, dir) {
+    for(j in 1:nrow(data)) {
+        if(length(data$photos[[j]])==0) {
+            next
+        }
+        else {
+            tryCatch(expr={get_some_photos(
+                               unlist(data$photos[j]),
+                               id=data$listing_id[j],
+                               folder=dir)},
+                     message=function(e) log_results(e),
+                     warning=function(e) handle_warnings(e),
+                     error=function(...) message(e),
+                     finally = {
+                         saveRDS(messagedf, file="messages.rds")
+                         saveRDS(warningvec, file="warnings.rds")
+                     }
+                     )
+        }
+    }
+
+}
+sample <- readRDS("photos_sample.rds")
+##because csvs and commas in text don't mix
+textonly <- dplyr::select(sample, description)
+readr::write_csv(textonly, "rentals_sample_text_only.csv")
+mydir <- dir.create("new_photos")
+t <- get_all_photos(sample, dir="new_photos/")
+#+END_SRC
+
+#+RESULTS:
+
+- OK, so I now have a whole bunch of images in the directory ~new_photos~.
+- I also have a dataframe which associates each of those images with a class.
+- I can now put them into individual class and train/val folders, as described in the section below.
+- I need to split the data from R
+- Then write a function to dump all of the images into the correct folders
+
+#+BEGIN_SRC R :session :results none
+photos_for_sample <- readRDS("photos_sample.rds")
+readr::write_csv(photos_for_sample, "photos_sample.csv")
+class_urls <- dplyr::select(photos_for_sample, interest_level, photos)
+class_urls$photo_list <- with(class_urls, lapply(photos, as.list))
+unnested <- select(class_urls, interest_level, photo_list) %>% unnest()
+list_to_df <- function(data, col) {
+    reslist <- vector(mode="list", length=nrow(data))
+    listcol <- data[[col]]
+
+    for(i in seq_along(listcol)) {
+        class <- as.character(data[i,"interest_level"])
+        len <- length(listcol[[i]])
+        classout <- rep(class, length=len)
+        urlout <- listcol[[i]]
+        reslist[[i]] <- data.frame(class=classout,url=urlout )
+    }
+    res <- dplyr::bind_rows(reslist)
+}
+
+unnested_urls <- list_to_df(class_urls, "photos")
+unnested_urls <- mutate(unnested_urls, url=gsub(".*/", "", x=url))
+list.files(path="new_photos/", pattern=unnested_urls$url[1])
+#+END_SRC
+
+- Huzzah, that list.files works
+- Some issues (caused by me being unable to get ~unnest~ to work)
+- Need to handle sampling appropriately
+- This means it needs to be done on ~listing_id~
+- Which means I need to mutate the above df and put listing_id in its own column
+
+#+BEGIN_SRC R :session :results none
+unnested_urls <- mutate(unnested_urls, listing_id=gsub("_.*", "", x=url))
+saveRDS(unnested_urls, file="urls_classes_listings.rds")
+class_list <- select(unnested_urls, listing_id, class) %>% unique()
+train <- with(class_list, caret::createDataPartition(class, times=1, p=0.7, list=FALSE))
+urls_train <- class_list[train,]
+urls_test <- class_list[-train,]
+
+unnested_train <- merge(unnested_urls, urls_train, by=c("class", "listing_id"))
+unnested_train$split <- "train"
+unnested_test <- merge(unnested_urls, urls_test, by=c("class", "listing_id"))
+unnested_test$split <- "val"
+saveRDS(unnested_train, file="train_urls.rds")
+saveRDS(unnested_test, file="test_urls.rds")
+#+END_SRC
+
+- So we now have a datafrmae containing the right names for files, along with classes and listings
+- The next step is to use file.copy/rename to move these to the appropriate folders
+- These should be high/train and high/val etc
+
+#+BEGIN_SRC R :session :results none
+dir.create("new_photos/high")
+dir.create("new_photos/high/train")
+dir.create("new_photos/high/val")
+
+dir.create("new_photos/med")
+dir.create("new_photos/med/train")
+dir.create("new_photos/med/val")
+
+dir.create("new_photos/low")
+dir.create("new_photos/low/train")
+dir.create("new_photos/low/val")
+
+move_photos_to_folder <- function(data) {
+    classes <- with(data, unique(class))
+    for (i in 1:length(classes)) {
+        class_urls <- with(data, data[class==classes[i],])
+        for (j in 1:nrow(class_urls)) {
+            split <- class_urls$split[j]
+            class <- classes[i]
+            path <- paste0(class, "/", split, "/", class_urls$url[j])
+            file.copy(from=class_urls$url[j], to=path)
+        }
+
+
+    }
+
+}
+
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle move.py
+import os
+import os.path
+import sys
+import csv
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("file")
+parser.add_argument("directory")
+args = parser.parse_args()
+print(args.directory)
+with open(args.file) as data:
+    os.chdir(args.directory)
+    myread = csv.reader(data, delimiter=',')
+    next(myread, None) #skip header
+    for row in myread:
+        lev,listing,url,split = row
+        destpath = "/".join([os.getcwd(),lev, split, url])
+        srcpath = "/".join([os.getcwd(), url])
+        if os.path.exists(srcpath):
+            os.rename(src=srcpath, dst=destpath)
+        else:
+            print("It does not exists (in this directory)")
+            pass
+
+
+#+END_SRC
+
+
+- Wow, that's a hell of a lot easier than it would have been with R.
+- I also learned (a really small amount) about the ~argparse~ module, which I believe has a clone in R
+- I should consider straight-up Python for a lot of this work in future
+
+
+#+BEGIN_SRC python :tangle asteroid_test.py
+import gym
+env = gym.make('Asteroids-v0')
+for i_episode in range(20):
+    observation = env.reset()
+    for t in range(100):
+        env.render()
+        print(observation)
+        action = env.action_space.sample()
+        observation, reward, done, info = env.step(action)
+        if done:
+            print("Episode finished after {} timesteps".format(t+1))
+            break
+#+END_SRC
+
+
+
+#+BEGIN_SRC
+
+#+END_SRC
+* PyTorch
+
+- So I managed to get around 10K worth of images.
+- This is good enough to start testing with.
+- I plan to use PyTorch, as it appears to work with my GPU and because I liked Torch's syntax.
+
+#+BEGIN_SRC python :session
+import torch as th
+import torchvision as tv
+#+END_SRC
+- This works, indicating that the packages are installed.
+
+- Tensors are like ndarrays (which are like matrices)
+
+- They can be used on GPUs to accelerate computation
+
+#+BEGIN_SRC python :session
+x = th.Tensor(5, 3)
+print(x)
+#+END_SRC
+
+#+RESULTS:
+
+- Random tensor
+
+#+BEGIN_SRC python :session :results output
+y = th.rand(5, 3)
+print(y)
+#+END_SRC
+
+#+RESULTS:
+:
+: 0.7230  0.6188  0.2749
+:  0.0346  0.8760  0.8594
+:  0.3078  0.8875  0.3584
+:  0.8441  0.3608  0.9202
+:  0.1699  0.1945  0.2956
+: [torch.FloatTensor of size 5x3]
+
+#+BEGIN_SRC python :session :results output
+print(y.size())
+
+#+END_SRC
+
+#+RESULTS:
+: torch.Size([5, 3])
+
+#+BEGIN_SRC python :session :results output
+print(x+y)
+#+END_SRC
+
+#+RESULTS:
+: -1.7168e+17  6.1880e-01  2.7489e-01
+:  3.4601e-02  8.7604e-01  8.5941e-01
+:  3.0783e-01  8.8750e-01  3.5845e-01
+:  8.4413e-01  3.6083e-01  9.2018e-01
+:  1.6988e-01  1.9452e-01  2.9561e-01
+: [torch.FloatTensor of size 5x3]
+
+#+BEGIN_SRC python :session :results output
+print(th.add(x, y))
+#+END_SRC
+
+#+RESULTS:
+: -1.7168e+17  6.1880e-01  2.7489e-01
+:  3.4601e-02  8.7604e-01  8.5941e-01
+:  3.0783e-01  8.8750e-01  3.5845e-01
+:  8.4413e-01  3.6083e-01  9.2018e-01
+:  1.6988e-01  1.9452e-01  2.9561e-01
+: [torch.FloatTensor of size 5x3]
+
+- We can assign an output tensor for the result
+#+BEGIN_SRC python :session :results output
+result = th.Tensor(5, 3)
+th.add(x, y, out=result)
+print(result)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+-1.7168e+17  6.1880e-01  2.7489e-01
+ 3.4601e-02  8.7604e-01  8.5941e-01
+ 3.0783e-01  8.8750e-01  3.5845e-01
+ 8.4413e-01  3.6083e-01  9.2018e-01
+ 1.6988e-01  1.9452e-01  2.9561e-01
+[torch.FloatTensor of size 5x3]
+-1.7168e+17  6.1880e-01  2.7489e-01
+ 3.4601e-02  8.7604e-01  8.5941e-01
+ 3.0783e-01  8.8750e-01  3.5845e-01
+ 8.4413e-01  3.6083e-01  9.2018e-01
+ 1.6988e-01  1.9452e-01  2.9561e-01
+[torch.FloatTensor of size 5x3]
+#+end_example
+
+We can also do in-place addition
+
+#+BEGIN_SRC python :session :results output
+y.add_(x)
+print(y)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+-1.7168e+17  6.1880e-01  2.7489e-01
+ 3.4601e-02  8.7604e-01  8.5941e-01
+ 3.0783e-01  8.8750e-01  3.5845e-01
+ 8.4413e-01  3.6083e-01  9.2018e-01
+ 1.6988e-01  1.9452e-01  2.9561e-01
+[torch.FloatTensor of size 5x3]
+-1.7168e+17  6.1880e-01  2.7489e-01
+ 3.4601e-02  8.7604e-01  8.5941e-01
+ 3.0783e-01  8.8750e-01  3.5845e-01
+ 8.4413e-01  3.6083e-01  9.2018e-01
+ 1.6988e-01  1.9452e-01  2.9561e-01
+[torch.FloatTensor of size 5x3]
+#+end_example
+
+- In place ops are designated with an underscore.
+
+- Standard numpy indexing
+
+#+BEGIN_SRC python :session :results output
+print(x[:,1])
+#+END_SRC
+
+#+RESULTS:
+: 1.00000e-41 *
+:   4.5736
+:   0.0000
+:   0.0000
+:   0.0067
+:   0.0000
+: [torch.FloatTensor of size 5]
+
+- Not 1-indexed, which confused me for a little while.
+
+*** Converting To and From Numpy
+
+#+BEGIN_SRC python :session :results output
+a = th.ones(5)
+print(a)
+#+END_SRC
+
+#+RESULTS:
+:
+: 1
+:  1
+:  1
+:  1
+:  1
+: [torch.FloatTensor of size 5]
+
+: o
+
+#+BEGIN_SRC python :session :results output
+b = a.numpy()
+print(b)
+#+END_SRC
+
+#+RESULTS:
+:
+: [ 1.  1.  1.  1.  1.]
+
+#+BEGIN_SRC python :session
+import numpy as np
+a = np.ones(5)
+b = th.from_numpy(a)
+np.add(a, 1, out=a)
+print(a)
+print(b)
+#+END_SRC
+
+#+RESULTS:
+| 2 | 2 | 2 | 2 | 2 |
+
+*** Cuda Tensors
+
+#+BEGIN_SRC python :session :results output
+if th.cuda.is_available():
+    x = x.cuda()
+    y = y.cuda()
+    x + y
+#+END_SRC
+
+#+RESULTS:
+
+- I need to log in again to activate nvidia.
+- This can be toggled using the following command
+
+#+BEGIN_SRC sh :eval false
+sudo nvidia-settings
+#+END_SRC
+
+** Autograd
+
+#+BEGIN_SRC python :session
+from torch.autograd import Variable
+x = Variable(th.ones(2, 2), requires_grad=True)
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC python :session :results output
+y = x + 2
+print(y)
+#+END_SRC
+
+#+RESULTS:
+:
+: Variable containing:
+:  3  3
+:  3  3
+: [torch.FloatTensor of size 2x2]
+
+- *y* has a creator because it was created by an operation
+#+BEGIN_SRC python :session :results output
+print(y.creator)
+#+END_SRC
+
+#+RESULTS:
+: <torch.autograd._functions.basic_ops.AddConstant object at 0x7f7eb12ed4c8>
+
+#+BEGIN_SRC python :session
+z = y * y * 3
+out = z.mean()
+print(z, out)
+#+END_SRC
+
+#+RESULTS:
+: Variable containing:
+:  27  27
+:  27  27
+: [torch.FloatTensor of size 2x2]
+
+#+BEGIN_SRC python :session
+out.backward(retain_variables=True)
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC python :session :results output
+x = th.randn(3)
+x = Variable(x, requires_grad=True)
+y = x * 2
+while y.data.norm() < 1000:
+    y = y * 2
+
+print(y)
+#+END_SRC
+
+#+RESULTS:
+:
+: >>> >>> ... ... >>> Variable containing:
+: -1079.9720
+:  -240.9234
+:  -451.8607
+: [torch.FloatTensor of size 3]
+
+#+BEGIN_SRC python :session :results output
+gradients = th.FloatTensor([0.1, 1.0, 0.0001])
+y.backward(gradients)
+print(x.grad)
+#+END_SRC
+
+#+RESULTS:
+:
+: >>> Variable containing:
+:   51.2000
+:  512.0000
+:    0.0512
+: [torch.FloatTensor of size 3]
+
+
+#+BEGIN_SRC python :session :tangle net.py
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Net(nn.Module):
+
+
+    def __init__(self):
+        super(Net, self).__init__()
+        #1 input channel, 6 output channels, 5*5 square convolution
+        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16*5*5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+
+    def forward(self, x):
+        #max pool over (2, 2) window
+        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
+        #if square mat then only specify a single number
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = x.view(-1, self.num_flat_features(x))
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+    def num_flat_features(self, x):
+        size = x.size()[1:] #everything except the batch dimension
+        num_features = 1
+        for s in size:
+            num_features *= s
+        return num_features
+
+
+net = Net()
+print(net)
+#+END_SRC
+
+#+RESULTS:
+
+We can return the learnable parameters using the following
+
+#+BEGIN_SRC python :session :results output
+params = list(net.parameters())
+print(len(params))
+print(params[0].size())
+
+#+END_SRC
+
+#+RESULTS:
+:
+: 10
+: torch.Size([6, 1, 5, 5])
+
+- We input an autograd.Variable to forward, and it returns the same
+
+#+BEGIN_SRC python :session :results output :tangle net.py
+input = Variable(torch.randn(1, 1, 32, 32))
+out = net(input)
+print(out)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/usr/local/lib/python3.5/dist-packages/torch/nn/modules/module.py", line 202, in __call__
+    result = self.forward(*input, **kwargs)
+  File "/usr/local/lib/python3.5/dist-packages/torch/nn/modules/module.py", line 65, in forward
+    raise NotImplementedError
+NotImplementedError
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'out' is not defined
+#+end_example
+
+
+- This is not working, let's try some test code to see if that works.
+
+#+BEGIN_SRC python :session :tangle test.py
+import torch
+import torch.nn.functional as nn
+import torch.autograd as autograd
+import torch.optim as optim
+import numpy as np
+from torch.autograd import Variable
+
+
+mnist = input_data.read_data_sets('../MNIST_data', one_hot=True)
+mb_size = 64
+Z_dim = 100
+X_dim = mnist.train.images.shape[1]
+y_dim = mnist.train.labels.shape[1]
+h_dim = 128
+lr = 1e-3
+
+
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC python :session :tangle testnet.py
+from __future__ import print_function
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.autograd import Variable
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
+        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(320, 50)
+        self.fc2 = nn.Linear(50, 10)
+
+    def forward(self, x):
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, training=self.training)
+        x = self.fc2(x)
+        return F.log_softmax(x)
+
+mod = Net()
+print(mod)
+
+#+END_SRC
+
+#+RESULTS:
+
+
+- To zero out buffers and backprops, use the following:
+
+#+BEGIN_SRC python :session :results output
+net.zero_grad()
+out.backward(torch.randn(1,10))
+#+END_SRC
+
+#+RESULTS:
+:
+: Traceback (most recent call last):
+:   File "<stdin>", line 1, in <module>
+: NameError: name 'out' is not defined
+
+** Loss Functions
+
+- Several different loss functions available.
+
+#+BEGIN_SRC python :session :tangle net.py
+output = net(input)
+target = Variable(torch.range(1, 10))
+criterion = nn.MSELoss()
+loss = criterion(output, target)
+print(loss)
+#+END_SRC
+
+next, we call loss.backward, and look at the bias gradients, before and after
+
+#+BEGIN_SRC python :session :tangle net.py
+net.zero_grad()
+print("conv.bias.grad before backward")
+print(net.conv1.bias.grad)
+loss.backward()
+print("conv.bias.grad after backward")
+print(net.conv1.bias.grad)
+#+END_SRC
+
+** Updating Weights
+
+- Simplest learning rule is called Stochastic Gradient Descent.
+
+Can be implemented with the following code
+
+#+BEGIN_SRC python :session :tangle net.py
+learning_rate = 0.0001
+for f in net.parameters():
+    f.data.sub_(f.grad.data * learning_rate)
+#+END_SRC
+
+#+RESULTS:
+
+
+There is a package available that includes lots of different optimisation methods.
+
+#+BEGIN_SRC python :tangle net.py
+import torch.optim as optim
+optimiser = optim.SGD(net.parameters(), lr=0.01)
+
+optimiser.zero_grad()
+output = net(input)
+loss = criterion(output, target)
+loss.backward()
+optimiser.step()
+#+END_SRC
+
+#+RESULTS:
+
+** Policy Gradients for ATARI Pong
+
+#+BEGIN_SRC python :tangle pg-pong.py
+import numpy as np
+import pickle as pickle
+import gym
+
+#hyperparameters
+H = 200 #hidden neurons
+batch_size = 10
+learning_rate = 1e-4
+gamma = 0.99 #discount factor for reward
+decay_rate = 0.99 #decay factor for RMSprop leaky sum of grad^2
+resume = False
+render = False
+
+D = 80 * 80 #input dim, 80x80 grid
+if resume:
+    model = pickle.load(open('save.p', 'rb'))
+else:
+    model = {}
+    model['W1'] = np.random.randn(H, D)/ np.sqrt(D)
+    model['W2'] = np.random.randn(H) / np.sqrt(H)
+
+grad_buffer = {k : np.zeros_like(v) for k, v in model.items()}
+rmsprop_cache = {k : np.zeros_like(v) for k,v in model.items()}
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def prepro(I):
+    """prepro 210x160x3 uint8 frame into 6400 (80x80) 1d float vector"""
+    I = I[35:195] #crop
+    I = I[::2, ::2, 0] #downsample by factor of 2
+    I[I == 144] = 0 #erase background
+    I[ I == 109] = 0 #erase background type 2
+    I[I != 0] = 1 #everything esle (paddles, ball) just set to 1
+    return I.astype(np.float).ravel()
+
+def discount_rewards(r):
+    """Take a 1D float array of rewards and compute discounted rewards"""
+    discounted_r = np.zeros_like(r)
+    running_add = 0
+    for t in reversed(range(0, r.size)):
+        if r[t] != 0: running_add = 0 #reset the sum, since this was a game boundary
+        running_add = running_add * gamma + r[t]
+        discounted_r[t] = running_add
+    return discounted_r
+
+def policy_forward(x):
+    h = np.dot(model['W1'], x)
+    h[h<0] = 0 #ReLU
+    logp = np.dot(model['W2'], h)
+    p = sigmoid(logp)
+    return p, h #return prob of taking action 2, and hidden state
+
+def policy_backward(eph, epdlogp):
+    """backward pass. (eph is array of intermediate hidden states)"""
+    dW2 = np.dot(eph.T, epdlogp).ravel()
+    dh = np.outer(epdlogp, model['W2'])
+    dh[eph<=0] = 0 #backrpop relu
+    dW1 = np.dot(dh.T, epx)
+    return {'W1':dW1, 'W2':dW2}
+
+env = gym.make('Pong-v0')
+observation = env.reset()
+prev_x = None
+xs,hs,dlogps,drs = [], [], [], []
+running_reward = None
+reward_sum = 0
+episode_number = 0
+while True:
+    if render: env.render()
+
+
+    cur_x = prepro(observation)
+    x = cur_x - prev_x if prev_x is not None else np.zeros(D)
+    prev_x = cur_x
+    #forward the policy network and sample an action from the returned probability
+    aprob, h = policy_forward(x)
+    action = 2 if np.random.uniform() < aprob else 3
+
+    #record various intermediates for backprop later
+    xs.append(x) #observation
+    hs.append(h) #hidden state
+    y = 1 if action == 2 else 0 # a fake label
+    dlogps.append(y - aprob) #grad to encourage the action that was taken to be taken
+    observation, reward, done, info = env.step(action)
+    reward_sum += reward
+
+    drs.append(reward)
+    if done:
+        episode_number +=1
+
+        #stack together all inputs, hiddens gradients and rewards
+        epx = np.vstack(xs)
+        eph = np.vstack(hs)
+        epdlogp = np.vstack(dlogps)
+        epr = np.vstack(drs)
+        xs,hs,dlogps,drs = [], [], [], []
+
+        #computed discounted rewards backwards through time
+        discounted_epr = discount_rewards(epr)
+        #standardise to be unit normal
+        discounted_epr -= np.mean(discounted_epr)
+        discounted_epr /= np.std(discounted_epr)
+
+        epdlogp *= discounted_epr
+        grad = policy_backward(eph, epdlogp)
+        for k in model: grad_buffer[k] += grad[k]
+
+        #performs parameters update every batch_size
+        if episode_number % batch_size == 0:
+            for k,v in model.items():
+                g = grad_buffer[k]
+                rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * g**2
+                model[k] += learning_rate * g / np.sqrt(rmsprop_cache[k] + 1e5)
+                grad_buffer[k] = np.zeros_like(v)
+
+        running_reward = reward_sum if running_reward is None else running_reward * 0.99 + reward_sum * 0.01
+        print('resetting enb. episode reward total was %f. Running mean %f' % (reward_sum, running_reward))
+        if episode_number % 100 == 0: pickle.dump(model, open('save.p', 'wb'))
+        reward_sum = 0
+        observation = env.reset()
+        prev_x = None
+    if reward !=0:
+        print('ep %d: game finished, reward: %f' %
+              (episode_number, reward))
+
+#+END_SRC
+** Datasets
+
+- torchvision is the package used for this.
+
+#+BEGIN_SRC python :tangle cifar10.py
+import torch
+import torchvision
+import torchvision.transforms as transforms
+#+END_SRC
+
+#+RESULTS:
+
+#+BEGIN_SRC python :tangle cifar10.py
+transform = transforms.Compose(
+    [transforms.ToTensor(),
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+
+)
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                        download=True, transform=transform)
+
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=4,
+                                          shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                        download=True, transform=transform)
+
+testloader = torch.utils.data.DataLoader(trainset, batch_size=4,
+                                          shuffle=True, num_workers=2)
+
+classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+#+END_SRC
+
+#+BEGIN_SRC python :tangle cifar10.py
+import matplotlib.pyplot as pyplot
+import numpy as np
+
+def imshow(img):
+    img = img / 2 + 0.5
+    npimg = img.numpy()
+    pyplot.imshow(np.transpose(npimg, (1, 2, 0)))
+
+dataiter = iter(trainloader)
+images, labels = dataiter.next()
+
+imshow(torchvision.utils.make_grid(images))
+
+print(' '.join('%5s' % classes[labels[j]] for j in range(4)))
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle cifar10.py
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 48, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(48, 16, 5)
+        self.fc1 = nn.Linear(16*5*5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84,10)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+net = Net()
+net.cuda()
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle cifar10.py
+import torch.optim as optim
+criterion = nn.CrossEntropyLoss()
+optimiser = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle cifar10.py
+for epoch in range(50):
+
+    running_loss = 0.0
+    for i, data in enumerate(trainloader, 0):
+        inputs, labels = data
+        inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
+        optimiser.zero_grad()
+
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimiser.step()
+
+        running_loss += loss.data[0]
+        if i % 2000 == 1999:
+            print('[%d, %5d] loss: %3f' %
+                  (epoch + 1, i + 1, running_loss/2000))
+            running_loss = 0.0
+print("Finished Training")
+
+#+END_SRC
+
+#+BEGIN_SRC python :tangle cifar10.py
+correct = 0
+total = 0
+for data in testloader:
+    images, labels = data
+    outputs = net(Variable(images.cuda()))
+    _, predicted = torch.max(outputs.data, 1)
+    total += labels.size(0)
+    correct += (predicted == labels.cuda()).sum()
+
+print("Accuracy of the network on the 10000 test images: %d %%" % (100 * correct/total))
+
+#+END_SRC
+
+- So assuming this is better than chance, let's examine which classes were the easiest to predict.
+
+#+BEGIN_SRC python :tangle cifar10.py
+class_correct = list(0. for i in range(10))
+class_total = list(0. for i in range(10))
+for data in testloader:
+    images,labels = data
+    outputs = net(Variable(images.cuda()))
+    _, predicted = torch.max(outputs.data, 1)
+    c = (predicted==labels.cuda()).squeeze()
+    for i in range(4):
+        label = labels[i]
+        class_correct[label] += c[i]
+        class_total[label] += 1
+
+for i in range(10):
+    print("Accuracy of %5s : %2d %%" % (
+        classes[i], 100 * class_correct[i]/class_total[i]))
+
+#+END_SRC
+
+** Loading Data
+
+The transfer learning tutorial ([[http://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html][here]]) gives some sense of how to load data into pytorch.
+
+- The folder structure is as follows
+
+#+BEGIN_SRC sh :results output
+ls hymenoptera_data
+#+END_SRC
+
+#+RESULTS:
+: train
+: val
+
+- We can see that data is divided into train and test folders.
+
+#+BEGIN_SRC sh :results output
+ls hymenoptera_data/train
+#+END_SRC
+
+#+RESULTS:
+: ants
+: bees
+
+- We can additionally see that the train/val folders are further subdivided into ants and bees (the classes to train against)
+
+#+BEGIN_SRC sh :results output
+ls hymenoptera_data/train/ants |head
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+0013035.jpg
+1030023514_aad5c608f9.jpg
+1095476100_3906d8afde.jpg
+1099452230_d1949d3250.jpg
+116570827_e9c126745d.jpg
+1225872729_6f0856588f.jpg
+1262877379_64fcada201.jpg
+1269756697_0bce92cdab.jpg
+1286984635_5119e80de1.jpg
+132478121_2a430adea2.jpg
+#+end_example
+
+- And within each of these folders are the actual images to train against.
+
+The data loading code itself is below.
+
+#+BEGIN_SRC python :tangle load_data.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import Variable
+import numpy as np
+import torchvision
+from torchvision import datasets, models, transforms
+import matplotlib.pyplot as plt
+import time
+import copy
+import os
+
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomSizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    ]),
+    'val': transforms.Compose([
+        transforms.Scale(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    ]),
+
+}
+data_dir = 'hymenoptera_data'
+dsets = { x: datasets.ImageFolder(os.path.join(data_dir, x), x) for x in ['train', 'val']}
+
+dset_loaders = {x: torch.utils.data.DataLoader(dsets[x], batch_size=4,
+                                               shuffle=True, num_workers=4)
+                for x in ['train', 'val']}
+dset_sizes = {x: len(dsets[x]) for x in ['train', 'val']}
+dset_classes = dsets['train'].classes
+#+END_SRC
+
+
+
+Ok, this code is pretty annoying and over-complicated.
+Addendum: this code above actually does a lot more than the code in my examples below.
+
+Most notably, its lazy which means that we read the images on demand, which facilitates the mini-batch style of programming that tends to be used with these models.
+#+BEGIN_SRC python
+from scipy import misc
+test = misc.imread("new_photos/high/train/6813074_14131e6d689be42a008e3a288a42fcb3.jpg")
+#+END_SRC
+
+This does the job of creating a array from the image pixels.
+
+#+BEGIN_SRC python :tangle load.py
+from scipy import misc
+import os as os
+targets = ["low", "medium", "high"]
+paths = []
+for x in targets:
+    paths.append(os.path.join("new_photos", x))
+fullpath = []
+imgs =[]
+for x in paths:
+    fullpath.append(os.path.join(x, "train"))
+
+for each in fullpath:
+    imglist = os.listdir(each)
+    for img in imglist:
+        try:
+            imgs.append(misc.imread(os.path.join(each, img)))
+        except Exception as e:
+            pass
+
+
+
+#+END_SRC
+
+#+BEGIN_SRC python :tangle rent_pred.py
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.datasets as datasets
+from torchvision import models, transforms
+import os as os
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+transform = {
+    'train': transforms.Compose([
+        transforms.CenterCrop(128),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5))]),
+    'val': transforms.Compose([
+        transforms.CenterCrop(128),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.5, 0.5, 0.5),
+            (0.5, 0.5, 0.5))])}
+
+
+# data_transforms = {
+    #     'train': transforms.Compose([
+    #         transforms.RandomSizedCrop(224),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    #     ]),
+    #     'val': transforms.Compose([
+    #         transforms.Scale(256),
+    #         transforms.CenterCrop(224),
+
+    #         transforms.ToTensor(),
+    #         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    #     ]),
+    # }
+data_dir = 'new_photos'
+dsets = { x: datasets.ImageFolder(os.path.join(data_dir, x), transform[x]) for x in ['train', 'val']}
+
+dset_loaders = {x: torch.utils.data.DataLoader(dsets[x], batch_size=6,
+                                               shuffle=True, num_workers=4)
+                                for x in ['train', 'val']}
+dset_sizes = {x: len(dsets[x]) for x in ['train', 'val']}
+dset_classes = dsets['train'].classes
+
+
+
+#+END_SRC
+
+#+BEGIN_SRC python :tangle rent_pred.py
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(3, 48, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(48, 64, 5)
+        self.conv3 = nn.Dropout2d()
+        self.fc1 = nn.Linear(64*29*29, 300)
+        self.fc2 = nn.Linear(300, 120)
+        self.fc3 = nn.Linear(120,3)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 64 * 29 * 29) #-1 ignores the minibatch
+        x = F.dropout(x, training=self.training)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+net = Net()
+net.cuda()
+
+#+END_SRC
+
+#+BEGIN_SRC python
+class Net(nn.Module):
+
+
+    def __init__(self):
+        super(Net, self).__init__()
+        #1 input channel, 6 output channels, 5*5 square convolution
+        self.conv1 = nn.Conv2d(3, 48, 5)
+        self.conv2 = nn.Conv2d(48, 120, 5)
+        self.fc1 = nn.Linear(120*5*5, 600)
+        self.fc1 = nn.Dropout()
+        self.fc2 = nn.Linear(600, 600)
+        self.fc3 = nn.Linear(600, 3)
+
+
+    def forward(self, x):
+        #max pool over (2, 2) window
+        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
+        #if square mat then only specify a single number
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = x.view(-1, self.num_flat_features(x))
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+    def num_flat_features(self, x):
+        size = x.size()[1:] #everything except the batch dimension
+        num_features = 1
+        for s in size:
+            num_features *= s
+        return num_features
+
+
+net = Net().cuda()
+print(net)
+#+END_SRC
+
+** Neural Nets in Practice
+- Minibatch size appears to be important
+- Learnng rate is also important
+- I need to read more of the Bengio book, as a lot of this appears to be covered
+
+
+#+BEGIN_SRC python :tangle rent_pred.py
+import torch.optim as optim
+import datetime
+criterion = nn.CrossEntropyLoss()
+optimiser = optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+phase = ['train', 'val']
+tr = dset_loaders['train']
+for epoch in range(10):
+    running_loss = 0.0
+    running_corrects = 0
+    for i, data in enumerate(tr, 0):
+        # get the inputs
+        inputs, labels = data
+        inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
+        optimiser.zero_grad()
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        _, preds = torch.max(outputs.data, 1)
+        loss.backward()
+        optimiser.step()
+        running_loss += loss.data[0]
+        running_corrects += torch.sum(preds == labels.data)
+    phase = 'train'
+    epoch_loss = running_loss / dset_sizes['train']
+    epoch_acc = running_corrects / dset_sizes['train']
+    print('{} Loss: {:.4f} Acc: {:.4f}'.format(
+                phase, epoch_loss, epoch_acc))
+    dtime = str(datetime.datetime.now())
+    outfilename = 'train' + "_" + str(epoch) +  "_" + dtime + ".tar"
+    torch.save(net.state_dict(), outfilename)
+print("Finished Training")
+val = dset_loaders['val']
+for epoch in range(5):
+    val_loss = 0.0
+    val_corrects = 0
+    for i, data in enumerate(val, 0):
+        inputs, labels = data
+        inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        _, preds = torch.max(outputs.data, 1)
+        val_loss += loss.data[0]
+        val_corrects += torch.sum(preds == labels.data)
+        phase = 'val'
+    val_epoch_loss = val_loss / dset_sizes['val']
+    val_epoch_acc = val_corrects / dset_sizes['val']
+    print('{} Loss: {:.4f}  Acc: {:.4f}'.format(
+            phase, val_epoch_loss, val_epoch_acc))
+print("Finished validation set")
+#+END_SRC
+
+So, I was getting failures, so simplifying the problem to debug errors.
+Still failures, even with the try block. I don't seem to be able to capture library errors (maybe I'm not using the right syntax?)
+Anyway, the problem actually lies in the image files themselves, as there are some which have zero bytes (presumably failed downloads).
+These need to be removed before I can use the model.
+
+It's probably just easier to remove these in a separate script.
+
+- So this now runs.
+
+Unfortunately, it appears that it sucks as a neural net.
+The loss is zig-zagging
+
+loss is 0.7628176212310791
+train Loss: 0.0001 Acc: 0.0006
+loss is 0.9246833920478821
+train Loss: 0.0001 Acc: 0.0005
+loss is 0.556501567363739
+train Loss: 0.0000 Acc: 0.0006
+loss is 1.046607494354248
+train Loss: 0.0001 Acc: 0.0004
+loss is 0.8465149402618408
+train Loss: 0.0001 Acc: 0.0005
+Finished Training
+
+- Yup, we can say that this sucks consistently.
+- This is presumably because the images themselves are not particularly predictive
+- Getting from pixels to interest is apparently difficult
+- A number of approaches can be tried:
+  - make the net deeper, add extra convolutions and layers
+  - Use an LSTM to build models for each property (i.e. actually solve the kaggle problem)
+  - Use the images with an autencoder to output features which can be used in a different model.
+
+train Loss: 0.1612 Acc: 0.6744
+loss is 1.6292909383773804
+train Loss: 0.1355 Acc: 0.6750
+loss is 0.8023977279663086
+train Loss: 0.1353 Acc: 0.6750
+loss is 0.820710301399231
+train Loss: 0.1353 Acc: 0.6750
+loss is 0.7990387678146362
+train Loss: 0.1353 Acc: 0.6750
+Finished Training
+
+- OTOH, maybe I just wasn't calculating accuracy accurately ;)
+
+- This is actually pretty reasonable
+
+- The real test is how it does on the validation data, however.
+
+#+BEGIN_SRC sh :eval no
+python rend_pred.py
+#+END_SRC
+
+#+RESULTS:
+train Loss: 0.1589 Acc: 0.6720
+train Loss: 0.1354 Acc: 0.6750
+train Loss: 0.1353 Acc: 0.6750
+train Loss: 0.1352 Acc: 0.6750
+train Loss: 0.1353 Acc: 0.6750
+Finished Training
+val Loss: 0.0002  Acc: 0.0000
+val Loss: 0.0001  Acc: 0.0002
+val Loss: 0.0001  Acc: 0.0002
+val Loss: 0.0004  Acc: 0.0000
+val Loss: 0.0002  Acc: 0.0000
+Finished validation set
+
+
+- So maybe it does suck, or maybe I'm just not running the predictions correctly
+- I probably need to save the model and interrogate it later
+
+
+
+
+#+BEGIN_SRC python
+data_dir = 'new_photos'
+empty =[]
+files = [file for file in glob.glob(data_dir + '/**/*.jpg', recursive=True)]
+for myfile in files:
+     if os.path.isfile(myfile):
+                if os.path.getsize(myfile)==0:
+                    empty.append(myfile)
+
+for emptyfile in empty:
+    os.remove(emptyfile)
+#+END_SRC
+
+This was actually pretty easy, at least once I found out that recursive globbing has been added in Python3.5, which at least jusitfies my use of it.
+
+#+BEGIN_SRC python
+import torch.optim as optim
+criterion = nn.CrossEntropyLoss()
+optimiser = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+num_epochs = 25
+
+for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train(True)  # Set model to training mode
+            else:
+                model.train(False)  # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # Iterate over data.
+            print(phase)
+            for data in dset_loaders[phase]:
+
+                # get the inputs
+                inputs, labels = data
+
+                # wrap them in Variable
+                if use_gpu:
+                    inputs, labels = Variable(inputs.cuda()), \
+                        Variable(labels.cuda())
+                else:
+                    inputs, labels = Variable(inputs), Variable(labels)
+
+                # zero the parameter gradients
+                optimizer.zero_grad()
+
+                # forward
+                outputs = model(inputs)
+                _, preds = torch.max(outputs.data, 1)
+                loss = criterion(outputs, labels)
+
+                # backward + optimize only if in training phase
+                if phase == 'train':
+                    loss.backward()
+                    optimizer.step()
+
+                # statistics
+                running_loss += loss.data[0]
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / dset_sizes[phase]
+            epoch_acc = running_corrects / dset_sizes[phase]
+
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(
+                phase, epoch_loss, epoch_acc))
+
+            # deep copy the model
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model = copy.deepcopy(model)
+
+        print()
+
+        time_elapsed = time.time() - since
+        print('Training complete in {:.0f}m {:.0f}s'.format(
+                time_elapsed // 60, time_elapsed % 60))
+        print('Best val Acc: {:4f}'.format(best_acc))
+        torch.save()
+#+END_SRC
+
+
+#+BEGIN_SRC python
+import torch.utils.data as data_utils
+
+train = data_utils.TensorDataset(features, targets)
+train_loader = data_utils.DataLoader(train, batch_size=50, shuffle=True)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle load_data.py
+def imshow(inp, title=None):
+    """Imshow for Tensor"""
+    inp = inp.numpy().transpose((1, 2, 0))
+    mean = np.array([0.485, .457, 0.406])
+    std = np.array([0.229,0.224, 0.225])
+    inp = std * inp + mean
+    plt.imshow(inp)
+    if title is not None:
+        plt.title(title)
+    plt.pause(10)
+
+inputs, classes = next(iter(dset_loaders['train']))
+
+out = torchvision.utils.make_grid(inputs)
+
+imshow(out, title=[dset_classes[x] for x in classes])
+#+END_SRC
+
+So, the next step is to arrange my data into the form that torch requires.
+- To do this, I need a mapping from listing id to interest level.
+- Each image was output in the following manner <listing_id>-i.jpg where i is the number of images processed (from 1, including the current) for the current listing.
+
+#+BEGIN_SRC R :session
+require(dplyr)
+int_level_listing_id <- select(sample_for_photos, listing_id, interest_level)
+images <- list.files("photos_sample/")
+img_listings <- unique(gsub("-[0-9]+.jpg", "", x=images))
+rental_images <- filter(sample_for_photos, listing_id %in% as.integer(img_listings))
+move_photo_to_folder <- function(data, dir, target, prop_train=0.7) {
+    trainval <- c("train", "val")
+    base_folder_names <- unique(data[[target]])
+    data[,"traintest"] <- runif(n=nrow(data))
+    for(i in 1:nrow(data)) {
+        listing <- unlist(data [i,"listing_id"])
+        impresent <- list.files(path=dir, pattern=as.character(listing))
+        print(length(impresent))
+        lev <- unlist(data [i,target])
+        if(data$traintest>=0.7) {
+                        path <- paste0("val", "/", lev, "/"   )
+        }
+
+    }
+
+}
+#+END_SRC
+
+#+RESULTS:
+- So, I an the code above on and off for around 2 days (from Wed-Fri)
+- I had terrible internet connection, and used my phone
+- I got 19K images from my 5k listings which is definitely enough to start playing with PyTorch in anger.
+
+
+** More PyTorch
+
+*** Reinforcement Learning Tutorial
+
+#+BEGIN_SRC python :tangle dqn.py
+import gym
+import math
+import random
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from collections import namedtuple
+from itertools import count
+from copy import deepcopy
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import torch.nn.functional as F
+import torchvision.transforms as T
+
+env = gym.make('CartPole-v0').unwrapped
+
+is_ipython = 'inline' in matplotlib.get_backend()
+
+if is_ipython:
+    from IPython import display
+
+plt.ion()
+#+END_SRC
+- Next., we need to implement functionality to get the images from the screen and replay them later.
+
+- We need two classes, Transition and ReplayMemory
+
+#+BEGIN_SRC python :tangle dqn.py
+Transition = namedtuple('Transition',
+                        ('state', 'action', 'next_state', 'reward'))
+
+class ReplayMemory(object):
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
+
+    def push(self, *args):
+        """Saves a transition"""
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+
+#+END_SRC
+
+- The model will be a CNN which takes the difference between current and previous screen patches.
+- Two outputs, left and right
+
+#+BEGIN_SRC python :tangle dqn.py
+class DQN(nn.Module):
+    def __init__(self):
+        super(DQN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=5, stride=2)
+        self.bn3 = nn.BatchNorm2d(32)
+        self.head = nn.Linear(448, 2)
+
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        return self.head(x.view(x.size(0), -1))
+
+#+END_SRC
+
+- The next step in the process is image extraction.
+- This uses the *torchvision* package to compose image transforms.
+
+#+BEGIN_SRC python :tangle dqn.py
+resize = T.Compose([
+    T.ToPILImage(),
+    T.Scale(40, interpolation=Image.CUBIC),
+    T.ToTensor()
+])
+
+screen_width = 600
+
+def get_cart_location():
+    world_width = env.x_threshold * 2
+    scale = screen_width / world_width
+    return int(env.state[0] * scale + screen_width / 2.0)
+
+def get_screen():
+    screen = env.render(mode='rgb_array').transpose(
+    (2, 0, 1)) #transpose to torch order CHW
+    #strip off the top and bottom of screen
+    screen = screen[:, 160:320]
+    view_width = 320
+    cart_location = get_cart_location()
+    if cart_location < view_width // 2:
+        slice_range = slice(view_width)
+    elif cart_location > (screen_width - view_width // 2):
+        slice_range = slice(-view_width, None)
+    else:
+        slice_range = slice(cart_location - view_width // 2,
+                            cart_location + view_width // 2)
+
+    #strip off the edges, so we have a square image centered on a cart
+    screen = screen[:, :, slice_range]
+    #convert to float, rescale, convert to torch tensor (no copy required)
+    screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
+    screen = torch.from_numpy(screen)
+    #resize and add a batch dimension
+    return resize(screen).unsqueeze(0)
+
+env.reset()
+plt.figure()
+plt.imshow(get_screen().squeeze(0).permute(
+    1, 2, 0).numpy(), interpolation=None)
+plt.title('Exampled extracted screen')
+plt.show()
+
+#+END_SRC
+
+- The next step is to train a model.
+- We need to use Variables (for gradients)
+- select_action: use an epsilon greedy policy
+
+
+#+BEGIN_SRC python :tangle dqn.py
+BATCH_SIZE = 128
+GAMMA = 0.999
+EPS_START = 0.9
+EPS_END = 0.05
+EPS_DECAY = 200
+USE_CUDA = torch.cuda.is_available()
+
+model = DQN()
+
+memory = ReplayMemory(10000)
+optimizer = optim.RMSprop(model.parameters())
+
+if USE_CUDA:
+    model.cuda()
+
+class Variable(autograd.Variable):
+
+    def __init__(self, data, *args, **kwargs):
+        if USE_CUDA:
+            data = data.cuda()
+        super(Variable, self).__init__(data, *args, **kwargs)
+
+
+steps_done = 0
+
+def select_action(state):
+    global steps_done
+    sample = random.random()
+    eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(
+        -1. * steps_done /EPS_DECAY)
+    steps_done += 1
+    if sample > eps_threshold:
+        return model(Variable(state, volatile=True)).data.max(1)[1].cpu()
+    else:
+        return torch.LongTensor([[random.randrange(2)]])
+
+episode_durations = []
+
+def plot_durations():
+    plt.figure(2)
+    plt.clf()
+    durations_t = torch.Tensor(episode_durations)
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('Duration')
+    plt.plot(durations_t.numpy())
+
+    if len(durations_t) >= 100:
+        means = durations_t.unfold(0, 100, 1).mean(1).view(-1)
+        means = torch.cat(torch.zeros(99), means)
+        plt.plot(means.numpy())
+    if is_ipython:
+        display.clear_output(wait=True)
+        display.display(plt.gcf())
+
+
+#+END_SRC
+
+- The next step is the training loop.
+
+#+BEGIN_SRC python :tangle dqn.py
+last_sync = 0
+
+def optimize_model():
+    global last_sync
+    if len(memory) < BATCH_SIZE:
+        return
+    transitions = memory.sample(BATCH_SIZE)
+
+    batch = Transition(*zip(*transitions))
+    #compute a mask of non-final states and concatenate the batch elements
+    non_final_mask = torch.ByteTensor(
+        tuple(map(lambda s: s is not None, batch.next_state)))
+    if USE_CUDA:
+        non_final_mask = non_final_mask.cuda()
+    #we don't want to backprop through the expected action values and volatile will save us on temporarily changing the model parameters
+    non_final_next_stages = Variable(torch.cat([s for s in
+                                                batch.next_state if s is not None]), volatile=True)
+    state_batch = Variable(torch.cat(batch.state))
+    action_batch = Variable(torch.cat(batch.action))
+    reward_batch = Variable(torch.cat(batch.reward))
+
+    #compute Q(s, t, a) - the model computes q(s, t) and then we select the columns of actions taken
+    state_action_values = model(state_batch).gather(1, action_batch)
+
+    #compute V(s_{t+1}) for all next states
+    next_state_values = Variable(torch.zeros(BATCH_SIZE))
+    next_state_values[non_final_mask] = model(non_final_next_states).max(1)[0]
+
+    next_state_values.volatile = False
+    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+    #compute huber loss
+    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
+
+    optimizer.zero_grad()
+    loss.backward()
+    for param in model.parameters():
+        param.grad.data.clamp(-1, 1)
+    optimizer.step()
+#+END_SRC
+
+#+BEGIN_SRC python :tangle dqn.py
+num_episodes = 10
+for i_episode in range(num_episodes):
+    env.reset()
+    last_screen = get_screen()
+    current_screen = get_screen()
+    state = current_screen - last_screen
+    for t in count():
+        action = select_action(state)
+        _, reward, done, _  = env.step(action[0, 0])
+        reward = torch.Tensor([reward])
+
+        last_screen = current_screen
+        current_screen = get_screen()
+        if not done:
+            next_state = current_screen - last_screen
+        else:
+            next_state = None
+
+        memory.push(state, action, next_state, reward)
+
+        state = next_state
+
+        optimize_model()
+        if done:
+            episode_durations.append(t + 1)
+            plot_durations()
+            break
+env.close()
+plt.ioff()
+plt.show()
+#+END_SRC
+
+- This script keeps erroring out, even when I clone from GitHub. The lack of any issues suggests that it must be something to do with my machine (I wonder are there pre-built AWS machine images I could check this against?).
+
+** Pytorch Learning by Examples
+
+***  Numpy CNN
+
+#+BEGIN_SRC python :tangle np_cnn.py
+import numpy as np
+
+#N is batch size; D is input dimension
+#H is hidden dimension, D_out is output dimension
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = np.random.randn(N, D_in)
+y = np.random.randn(N, D_out)
+#randomly initialise weights
+w1 = np.random.randn(D_in, H)
+w2 = np.random.randn(H, D_out)
+
+learning_rate = 1e-6
+for t in range(500):
+    #forward pass, compute predicted y
+    h = x.dot(w1)
+    h_relu = np.maximum(h, 0)
+    y_pred = h_relu.dot(w2)
+
+    #compute and print loss
+    loss = np.square(y_pred - y).sum()
+    print(t, loss)
+
+    #backprop to comput gradients of w1 and w2 wrt loss
+    grad_y_pred = 2.0 * (y_pred - y)
+    grad_w2 = h_relu.T.dot(grad_y_pred)
+    grad_h_relu = grad_y_pred.dot(w2.T)
+    grad_h = grad_h_relu.copy()
+    grad_h[h<0] = 0
+    grad_w1 = x.T.dot(grad_h)
+
+    w1 -= learning_rate * grad_w1
+    w2 -= learning_rate * grad_w2
+
+#+END_SRC
+
+#+BEGIN_SRC python :tangle th_two_layer.py
+import torch
+
+# dtype = torch.FloatTensor-
+dtype = torch.cuda.FloatTensor
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = torch.randn(N, D_in).type(dtype)
+y = torch.randn(N, D_out).type(dtype)
+
+w1 = torch.randn(D_in, H).type(dtype)
+w2 = torch.randn(H, D_out).type(dtype)
+
+learning_rate = 1e-6
+for t in range(500):
+    #forward pass, compute predicted y
+    h = x.mm(w1)
+    h_relu = h.clamp(min=0)
+    y_pred = h_relu.mm(w2)
+    #compute and print loss
+    loss = (y_pred - y).pow(2).sum()
+    print(t, loss)
+
+    #backprop to compute gradients with respec to loss
+    grad_y_pred = 2.0 * (y_pred - y)
+    grad_w2 = h_relu.t().mm(grad_y_pred)
+    grad_h_relu = grad_y_pred.mm(w2.t())
+    grad_h = grad_h_relu.clone()
+    grad_h[h<0] = 0
+    grad_w1 = x.t().mm(grad_h)
+
+    w1 -= learning_rate * grad_w1
+    w2 -= learning_rate * grad_w2
+
+#+END_SRC
+
+- Above, we needed to manually implement differentiation for both forward and backward operators.
+- This is not a particularly scalable solution for large networks
+- Therefore torch has a solution, whereby the backward operation is implemented automatically given the forward operator.
+- This is accomplished by wrapping the tensor in a variable
+- Variables implement almost all of the Tensor API.
+
+#+BEGIN_SRC python :tangle autograd.py
+import torch
+from torch.autograd import Variable
+dtype = torch.FloatTensor
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+#require_grad=false means that we don't need to compute gradients with respect to these variables in the backward pass
+x = Variable(torch.randn(N, D_in).type(dtype), requires_grad=False)
+y = Variable(torch.randn(N, D_out).type(dtype), requires_grad=False)
+
+w1 = Variable(torch.randn(D_in, H).type(dtype), requires_grad=True)
+w2 = Variable(torch.randn(H, D_out).type(dtype), requires_grad=True)
+
+learning_rate = 1e-6
+
+for t in range(500):
+    # forward pass: compute predicted y using operatoions on variables, these # are exactly the same operations we used to compute the forward pass usding # tensors, but we do not need to keep references to intermediate values since # we are not implementing the backward pass by hand
+    y_pred = x.mm(w1).clamp(min=0).mm(w2)
+    #compute and print loss using variables
+    loss = (y_pred - y).pow(2).sum()
+    print(t, loss.data[0])
+
+    # use autograd to compute the backwards pass. This call with compute the
+    # gradient of loss with respect to all variables with requires_grad=True
+    # after this call w1.grad and w2.grad will be variables holding the
+    # gradient of the loss with respect to w1 and w2 respectively
+    loss.backward() #magic. much wow
+
+    # update weights using gradient descent: w1.data and w2.data are Tensors
+    # w1.grad and w2.grad are Variables and w1.grad.data and w2.grad.data are
+    # Tensors
+    w1.data -= learning_rate * w1.grad.data
+    w2.data -= learning_rate * w2.grad.data
+
+    w1.grad.data.zero_()
+    w2.grad.data.zero_()
+#+END_SRC
+
+- Methods that end with an underscore update in place.
+- That was definitely mentioned in one tutorial, but should probably be mentioned in a bunch more.
+- Custom autograd functions can be created by subclassing torch.autograd.function.
+
+#+BEGIN_SRC python :tangle new_grad_func.py
+import torch
+from torch.autograd import Variable
+
+class MyReLU(torch.autograd.Function):
+    """
+    We can implement our own custom autograd Functions by sub-classing torch.autograd.Function and implementing the forward and backward passes which operate on Tensors.
+    """
+    def forward(self, input):
+        """In the forward pass we receive a Tensor containing the input and return a Tensor containing the output. You can cache arbitrary Tensors for use in the backward pass using the save_for_backward method"""
+        self.save_for_backward(input)
+        return input.clamp(min=0)
+
+    def backward(self, grad_output):
+
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss with respect to the output, and we need to compute the gradient of the loss with respect to the input.
+"""
+        input, = self.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[input < 0] = 0
+        return grad_input
+
+dtype = torch.cuda.FloatTensor
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+# Create random Tensors to hold input and outputs, and wrap them in Variables.
+x = Variable(torch.randn(N, D_in).type(dtype), requires_grad=False)
+y = Variable(torch.randn(N, D_out).type(dtype), requires_grad=False)
+
+# Create random Tensors for weights, and wrap them in Variables.
+w1 = Variable(torch.randn(D_in, H).type(dtype), requires_grad=True)
+w2 = Variable(torch.randn(H, D_out).type(dtype), requires_grad=True)
+
+learning_rate = 1e-6
+for t in range(500):
+    # construct an instance of our MyRelU class to use in our network
+    relu = MyReLU()
+    y_pred = relu(x.mm(w1).mm(w2))
+
+    loss = (y_pred - y).pow(2).sum()
+    print(t, loss.data[0])
+    loss.backward()
+
+    w1.data -= learning_rate * w1.grad.data
+    w2.data -= learning_rate * w2.grad.data
+
+    w1.grad.data.zero_()
+    w2.grad.data.zero_()
+
+
+
+#+END_SRC
+
+
+
+#+BEGIN_SRC python :tangle torch_tf.py
+import tensorflow as tf
+import numpy as np
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = tf.placeholder(tf.float32, shape=(None, D_in))
+y = tf.placeholder(tf.float32, shape=(None, D_out))
+
+w1 = tf.Variable(tf.random_normal((D_in, H)))
+w2 = tf.Variable(tf.random_normal((H, D_out)))
+
+h = tf.matmul(x, w1)
+h_relu = tf.maximum(h, tf.zeros(1))
+y_pred = tf.matmul(h_relu, w2)
+
+loss = tf.reduce_sum((y - y_pred)**2.0)
+
+grad_w1, grad_w2 = tf.gradients(loss, [w1, w2])
+
+learning_rate = 1e-6
+
+new_w1 = w1.assign(w1 - learning_rate * grad_w1)
+new_w2 = w2.assign(w2 - learning_rate * grad_w2)
+
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+
+    x_value = np.random.randn(N, D_in)
+    y_value = np.random.randn(N, D_out)
+    for _ in range(500):
+        loss_value, _, _ = sess.run([loss, new_w1, new_w2],
+                                    feed_dict={x: x_value, y: y_value})
+        print(loss_value)
+
+
+
+#+END_SRC
+
+- Autograd is pretty low-level
+- We normally want to think about neural networks in terms of layers
+- The nn package allows us to do this in PyTorch.
+- This package defines a set of modules, which are equivalent to layers
+- Takes and outputs variables, but may also define internal state
+- Also contains a set of useful log functions
+
+#+BEGIN_SRC python :tangle nn_net.py
+import torch
+from torch.autograd import Variable
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = Variable(torch.randn(N, D_in))
+y = Variable(torch.randn(N, D_out), requires_grad=False)
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(D_in, H),
+    torch.nn.ReLU(),
+    torch.nn.Linear(H, D_out)
+)
+
+loss_fn = torch.nn.MSELoss(size_average=False)
+
+learning_rate = 1e-4
+
+for t in range(500):
+    y_pred = model(x)
+    loss = loss_fn(y_pred, y)
+    print(t, loss.data[0])
+    model.zero_grad()
+    loss.backward()
+
+    for param in model.parameters():
+        param.data -= learning_rate * param.grad.data
+#+END_SRC
+
+- Up till this point, we have updated the weights manually
+- the *optim* package provides a means to automate this
+- This matters more when we use complicated loss functions
+
+#+BEGIN_SRC python :tangle nn_optim.py
+import torch
+from torch.autograd import Variable
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = Variable(torch.randn(N, D_in))
+y = Variable(torch.randn(N, D_out), requires_grad=False)
+
+model = torch.nn.Sequential(
+    torch.nn.Linear(D_in, H),
+    torch.nn.ReLU(),
+    torch.nn.Linear(H, D_out),
+)
+
+loss_fn = torch.nn.MSELoss(size_average=False)
+
+learning_rate = 1e-4
+optimiser = torch.optim.Adam(model.parameters(), lr=learning_rate)
+for t in range(500):
+    y_pred = model(x)
+    loss = loss_fn(y_pred, y)
+    print(t, loss.data[0])
+    optimiser.zero_grad()
+    loss.backward()
+    optimiser.step()
+#+END_SRC
+
+- You can also specify custom models that are more complex than a series of existing modules.
+- For example, the simple two layer network can be implemented as a custom module subclass.
+
+#+BEGIN_SRC python :tangle custom_nn_mod.py
+import torch
+from torch.autograd import Variable
+
+class TwoLayerNet(torch.nn.Module):
+    def __init__(self, D_in, H, D_out):
+        super(TwoLayerNet, self).__init__()
+        self.linear1 = torch.nn.Linear(D_in, H)
+        self.linear2 = torch.nn.Linear(H, D_out)
+
+    def forward(self, x):
+        h_relu = self.linear1(x).clamp(min=0)
+        y_pred = self.linear2(h_relu)
+        return y_pred
+
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+x = Variable(torch.randn(N, D_in))
+y = Variable(torch.randn(N, D_out), requires_grad=False)
+
+model = TwoLayerNet(D_in, H, D_out)
+
+criterion = torch.nn.MSELoss(size_average=False)
+
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+for t in range(500):
+    y_pred = model(x)
+    loss = criterion(y_pred, y)
+    print(t, loss.data[0])
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+
+
+#+END_SRC
+
+- We now implement a strange model (fully connected reLU with a random number of hidden layers).
+
+#+BEGIN_SRC python :tangle odd_model.py
+import random
+import torch
+from torch.autograd import Variable
+
+class DynamicNet(torch.nn.Module):
+    def __init__(self, D_in, H, D_out):
+        super(DynamicNet, self).__init__()
+        self.input_linear = torch.nn.Linear(D_in, H)
+        self.middle_linear = torch.nn.Linear(H, H)
+        self.output_linear = torch.nn.Linear(H, D_out)
+
+    def forward(self, x):
+        h_relu = self.input_linear(x).clamp(min=0)
+        for _ in range(random.randint(0, 3)):
+            h_relu = self.middle_linear(h_relu).clamp(min=0)
+        y_pred = self.output_linear(h_relu)
+        return y_pred
+
+N, D_in, H, D_out = 64, 1000, 100, 10
+
+# Create random Tensors to hold inputs and outputs, and wrap them in Variables
+x = Variable(torch.randn(N, D_in))
+y = Variable(torch.randn(N, D_out), requires_grad=False)
+
+# Construct our model by instantiating the class defined above
+model = DynamicNet(D_in, H, D_out)
+
+# Construct our loss function and an Optimizer. Training this strange model with
+# vanilla stochastic gradient descent is tough, so we use momentum
+criterion = torch.nn.MSELoss(size_average=False)
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-4, momentum=0.9)
+for t in range(500):
+    # Forward pass: Compute predicted y by passing x to the model
+    y_pred = model(x)
+
+    # Compute and print loss
+    loss = criterion(y_pred, y)
+    print(t, loss.data[0])
+
+    # Zero gradients, perform a backward pass, and update the weights.
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+#+END_SRC
+
+** Deep Learning for NLP with PyTorch
+
+#+BEGIN_SRC python :tangle tensors.py
+import torch
+import torch.autograd as autograd
+import torch.nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+torch.manual_seed(1)
+
+V_data = [1., 2., 3.]
+V = torch.Tensor(V_data)
+print(V)
+
+M_data = [[1., 2., 3. ],[4., 5., 6.]]
+M = torch.Tensor(M_data).cuda()
+print(M)
+T_data = [[[1., 2.], [3., 4.]],
+          [[5., 6.], [7., 8.]]]
+T = torch.Tensor(T_data)
+print(T)
+print(V[0])
+print(M[0])
+print(T[0])
+
+#+END_SRC
+
+#+RESULTS:
+
+- Ah, it's so insane
+- The result of some_object[0] is dependent on the nature of the object
+- If a 1d tensor, it returns a scalar
+- If a 2d tensor (matrix) it returns the first row
+- If a 3d tensor, it returns a matrix (the first one)
+- And I thought R was crazy...
+
+#+BEGIN_SRC python :tangle tensors.py
+integer = torch.LongTensor([1, 2, 3])
+print(integer)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle tensors.py
+x = torch.randn(3, 4, 5)
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle tensors.py
+#default is to concat across rows
+x_1 = torch.randn(2, 5)
+y_1 = torch.randn(3, 5)
+z_1 = torch.cat([x_1, y_1])
+print(z_1)
+x_2 = torch.randn(2, 3)
+y_2 = torch.randn(2, 5)
+z_2 = torch.cat([x_2, y_2], 1)
+print(z_2)
+#+END_SRC
+
+
+- The view method is used to reshape tensors.
+
+#+BEGIN_SRC python :tangle tensors.py
+x = torch.randn(2, 3, 4)
+print(x)
+print(x.view(2, 12))
+print(x.view(2, -1))
+print(x.view(4, 3, 2))
+#+END_SRC
+
+#+BEGIN_SRC python :tangle tensors.py
+x = autograd.Variable(torch.Tensor([1., 2., 3.]), requires_grad=True)
+print(x.data)
+
+y = autograd.Variable(torch.Tensor([4., 5., 6.]), requires_grad=True)
+z = x + y
+print(z.data)
+print(z.creator)
+#+END_SRC
+
+- Gradients store history, for efficient backprop.
+
+#+BEGIN_SRC python :tangle tensors.py
+s = z.sum()
+print(s)
+print(s.creator)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle tensors.py
+s.backward()
+print(x.grad)
+#+END_SRC
+
+- This should change everytime its run, eventually ending up as a constant
+#+BEGIN_SRC python :tangle tensors.py
+x = torch.randn((2, 2))
+y = torch.randn((2, 2))
+z = x + y
+
+var_x = autograd.Variable(x)
+var_y = autograd.Variable(y)
+
+var_z = var_x + var_y
+
+var_z_data =  var_z.data
+
+new_var_z = autograd.Variable(var_z_data)
+
+print(new_var_z.creator)
+
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle tensors.py
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+torch.manual_seed(1)
+
+lin = nn.Linear(5, 3)
+data = autograd.Variable(torch.randn(2, 5))
+print(lin(data))
+#+END_SRC
+
+#+BEGIN_SRC python :session :tangle ls.py
+def ls():
+    res = dir()
+    return(res)
+#+END_SRC
+- I want a function that strips the garbage from dir in the REPL
+
+- Sigmoid gradients are hard to learn, while tan and ReLU are much easier
+
+#+BEGIN_SRC python :tangle tensors.py
+data = autograd.Variable(torch.randn(2, 2))
+print(data)
+print(F.relu(data))
+#+END_SRC
+
+- Softmax is used to output a probability distribution over the output.
+
+#+BEGIN_LaTeX
+\begin{equation}
+  exp(x_i)/\Sigma_j(x_j)
+\end{equation}
+#+END_LaTeX
+
+-Defined above
+#+BEGIN_SRC python :tangle tensors.py
+data = autograd.Variable(torch.randn(5))
+print(data)
+print(F.softmax(data))
+print(F.softmax(data).sum())
+print(F.log_softmax(data))
+#+END_SRC
+
+*** Networks
+
+- Must inherit from nn.Module and override the forward() method.
+- this module handles GPU integration and lots of other stuff
+- We'll use PyTorch to do logistic regression over some text and decide whether its English or Spanish
+
+
+#+BEGIN_SRC python :tangle bow.py
+import torch
+import autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+label_to_ix = {"SPANISH": 0, "ENGLISH": 0}
+data = [("me gusta comer en la cafeteria".split(), "SPANISH"),
+        ("Give it to me".split(), "ENGLISH"),
+        ("No creo que sea una buena idea".split(), "SPANISH"),
+        ("No it is not a good idea to get lost at sea".split(), "ENGLISH")]
+
+test_data = [("Yo creo que si".split(), "SPANISH"),
+             ("it is lost on me".split(), "ENGLISH")]
+
+word_to_ix = {}
+for sent, _ in data + test_data:
+    for word in sent:
+        if word not in word_to_ix:
+            word_to_ix[word] = len(word_to_ix)
+print(word_to_ix)
+
+VOCAB_SIZE = len(word_to_ix)
+NUM_LABELS = 2
+
+class BoWClassifier(nn.Module):
+
+    def __init__(self, num_labels, vocab_size):
+        super(BoWClassifier, self).__init__()
+        self.linear = nn.Linear(vocab_size, num_labels)
+
+    def forward(self, bow_vec):
+        return F.log_softmax(self.linear(bow_vec))
+
+def make_bow_vector(sentence, word_to_ix):
+    vec = torch.zeros(len(word_to_ix))
+    for word in sentence:
+        vec[word_to_ix[word]] += 1
+    return vec.view(1, -1)
+
+def make_target(label, label_to_ix):
+    return torch.LongTensor([label_to_ix[label]])
+
+model = BoWClassifier(NUM_LABELS, VOCAB_SIZE)
+
+for param in model.parameters():
+    print(param)
+
+sample = data[0]
+bow_vector = make_bow_vector(sample[0], word_to_ix)
+log_probs = model(autograd.Variable(bow_vector))
+
+print(log_probs)
+
+#+END_SRC
+
+#+BEGIN_SRC python :tangle bow.py
+for instance, label in test_data:
+    bow_vec = autograd.Variable(make_bow_vector(instance, word_to_ix))
+    log_probs = model(bow_vec)
+    print(log_probs)
+
+print(next(model.parameters())[:, word_to_ix['creo']])
+
+loss_function = nn.NLLLoss()
+optimiser = optim.SGD(model.parameters(), lr=0.1)
+
+for epoch in range(100):
+    for instance, label in data:
+        model.zero_grad()
+        bow_vec = autograd.Variable(make_bow_vector(instance, word_to_ix))
+        target = autograd.Variable(make_target(label, label_to_ix))
+        log_probs = model(bow_vec)
+        loss = loss_function(log_probs, target)
+        loss.backward()
+        optimiser.step()
+
+for instance, label in test_data:
+    bow_vec = autograd.Variable(make_bow_vector(instance, word_to_ix))
+    log_probs = model(bow_vec)
+    print(log_probs)
+
+print(next(model.parameters())[:, word_to_ix["creo"]])
+#+END_SRC
+
+#+BEGIN_SRC python :tangle embeddings.py
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+torch.manual_seed(1)
+
+word_to_ix = {"hello": 0, "world": 1}
+embeds = nn.Embedding(2, 5) #two words in five dimensions
+lookup_tensor = torch.LongTensor([word_to_ix["hello"]])
+hello_embed = embeds(autograd.Variable(lookup_tensor))
+print(hello_embed)
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle embeddings.py
+CONTEXT_SIZE = 2
+EMBEDDING_DIM = 10
+test_sentence = """When forty winters shall besiege thy brow,
+And dig deep trenches in thy beauty's field,
+Thy youth's proud livery so gazed on now,
+Will be a totter'd weed of small worth held:
+Then being asked, where all thy beauty lies,
+Where all the treasure of thy lusty days;
+To say, within thine own deep sunken eyes,
+Were an all-eating shame, and thriftless praise.
+How much more praise deserv'd thy beauty's use,
+If thou couldst answer 'This fair child of mine
+Shall sum my count, and make my old excuse,'
+Proving his beauty by succession thine!
+This were to be new made when thou art old,
+And see thy blood warm when thou feel'st it cold.""".split()
+#ignoring tokenisation for the lols
+trigrams = [([test_sentence[i], test_sentence[i + 1]], test_sentence[i + 2])
+            for i in range(len(test_sentence) - 2)]
+
+print(trigrams[:3])
+
+vocab = set(test_sentence)
+word_to_ix = { word: i for i, word in enumerate(vocab)}
+
+class NGramLanguageModeler(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, context_size):
+        super(NGramLanguageModeler, self).__init__()
+        self.embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.linear1 = nn.Linear(context_size * embedding_dim, 128)
+        self.linear2 = nn.Linear(128, vocab_size)
+    def forward(self, inputs):
+        embeds = self.embeddings(inputs).view(1, -1)
+        out = F.relu(self.linear1(embeds))
+        out = self.linear2(out)
+        log_probs = F.log_softmax(out)
+        return log_probs
+
+losses = []
+loss_function = nn.NLLLoss()
+model = NGramLanguageModeler(len(vocab), EMBEDDING_DIM, CONTEXT_SIZE)
+optimiser = optim.SGD(model.parameters(), lr=0.001)
+for epoch in range(10):
+    total_loss = torch.Tensor([0])
+    for context, target in trigrams:
+        context_idxs = [word_to_ix[w] for w in context]
+        context_var = autograd.Variable(torch.LongTensor(context_idxs))
+        model.zero_grad()
+        log_probs = model(context_var)
+        loss = loss_function(log_probs, autograd.Variable(
+            torch.LongTensor([word_to_ix[target]])))
+        loss.backward()
+        optimiser.step()
+
+        total_loss += loss.data
+    losses.append(total_loss)
+print(losses)
+
+#+END_SRC
+
+*** Conditional bag of words
+
+#+BEGIN_SRC python :tangle cbow.py
+import torch as torch
+import torch.nn as nn
+import torch.autograd as autograd
+import torch.optim as optim
+import torch.nn.functional as F
+CONTEXT_SIZE = 2  # 2 words to the left, 2 to the right
+EMBEDDING_DIM = 128
+raw_text = """We are about to study the idea of a computational process.
+Computational processes are abstract beings that inhabit computers.
+As they evolve, processes manipulate other abstract things called data.
+The evolution of a process is directed by a pattern of rules
+called a program. People create programs to direct processes. In effect,
+we conjure the spirits of the computer with our spells.""".split()
+vocab = set(raw_text)
+word_to_ix = {word: i for i , word in enumerate(vocab)}
+data = []
+for i in range(2, len(raw_text) - 2):
+    context = [raw_text[i-2], raw_text[i - 1],
+               raw_text[i + 1], raw_text[i + 2]]
+    target = raw_text[i]
+    data.append((context, target))
+print(data[:5])
+
+
+
+class CBOW(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, context_size):
+        super(CBOW, self).__init__()
+        self.embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.linear1 = nn.Linear(128, 64)
+        self.linear2 = nn.Linear(64, vocab_size)
+    def forward(self, inputs):
+        print(inputs)
+        embeds =self.embeddings(inputs)
+        out = F.relu(self.linear1(embeds))
+        out = self.linear2(out)
+        log_probs = F.log_softmax(out)
+        return log_probs
+
+
+
+def make_context_vector(context, word_to_ix):
+    idxs = [word_to_ix[w] for w in context]
+    tensor = torch.LongTensor(idxs)
+    return autograd.Variable(tensor)
+
+losses = []
+loss_function = nn.NLLLoss()
+
+model = CBOW(len(vocab), EMBEDDING_DIM, CONTEXT_SIZE)
+optimizer = optim.SGD(model.parameters(), lr=0.001)
+
+make_context_vector(data[0][0], word_to_ix)
+
+for epoch in range(10):
+    for context, target in data:
+        print(target)
+        vec = make_context_vector(context, word_to_ix)
+        model.zero_grad()
+        log_probs = model(vec)
+        loss = loss_function(log_probs, autograd.Variable(
+            torch.LongTensor(word_to_ix[target])))
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.data
+    losses.append(total_loss)
+print(losses)
+#+END_SRC
+
+- I failed at implementing this, I'm clearly missing something important
+- The loss function is the problem.
+- I get ~RuntimeError: Assertion `THIndexTensor_(size)(target, 0) == batch_size' failed.~ which is basically just telling me that the size is wrong
+- I think that this is caused by my ~word_to_ix~ implementation
+- In the previous model, its a set.
+- But such is not shown here.
+- If I just copy the torch.LongTensor(word_to_ix[target]) then I get a tensor of 2*1.
+- Unfortunately, my output has a size of 4
+- This presumably causes the problems.
+*** LSTM models (sequences more generally)
+
+#+BEGIN_SRC python :tangle lstm.py
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+torch.manual_seed(1)
+
+lstm = nn.LSTM(3, 3)
+inputs = [autograd.Variable(torch.randn((1, 3)))
+          for _ in range(5)]
+
+hidden = (autograd.Variable(torch.randn(1, 1, 3)),
+          autograd.Variable(torch.randn(1, 1, 3)))
+
+for i in inputs:
+    #step through the sequence one at a time
+    #after each step, hidden contains the hidden state
+    out, hidden = lstm(i.view(1, 1, -1), hidden)
+
+#alternatively, the entire sequence can be generated all at once
+inputs = torch.cat(inputs).view(len(inputs), 1, -1)
+hidden = (autograd.Variable(torch.randn((1, 1, 3))), autograd.Variable(
+    torch.randn((1, 1, 3))))
+out, hidden = lstm(inputs, hidden)
+print(out)
+print(hidden)
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle pos.py
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+def prepare_sequence(seq, to_ix):
+    idxs = [to_ix[w] for w in seq]
+    tensor = torch.LongTensor(idxs)
+    return autograd.Variable(tensor)
+
+
+training_data = [
+    ("The dog ate the apple".split(), ["DET", "NN", "V", "DET", "NN"]),
+    ("Everybody read that book".split(), ["NN", "V", "DET", "NN"])
+]
+word_to_ix = {}
+
+for sent, tags in training_data:
+    for word in sent:
+        if word not in word_to_ix:
+            word_to_ix[word] = len(word_to_ix)
+
+print(word_to_ix)
+
+tag_to_ix = {"DET": 0, "NN": 1, "V": 2}
+
+EMBEDDING_DIM = 6
+HIDDEN_DIM = 6
+
+#+END_SRC
+
+#+BEGIN_SRC python pos.py
+class LSTMTagger(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, vocab_size, tagset_size):
+        super(LSTMTagger, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        #lstm takes word embeddings as inputs and outputs hidden states
+        #with dimensionality hidden_dim
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim)
+        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
+        self.hidden = self.init_hidden()
+
+    def init_hidden(self):
+    #state doesn't exist before we do anything
+    #docs explain this more
+    #axes semantics are (num_layers, minibatch_size, hidden_dim)
+    return (autograd.Variable(torch.zeros(1, 1, self.hidden_dim)),
+            autograd.Variable(torch.zeros(1, 1, self.hidden_dim)))
+
+    def forward(self, sentence):
+        embeds = self.word_embeddings(sentence)
+        lstm_out, self.hidden = self.lstm(
+            embeds.view(len(sentence), 1, -1),
+            self.hidden)
+        tag_space - self.hidden2tag(lstm_out.view(len(sentence) -1))
+        tag_scores = F.log_softmax(tag_space)
+        return tag_scores
+
+model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix))
+loss_function = nn.NLLLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.1)
+
+inputs = prepare_sequence(training_data[0][0], word_to_ix)
+tag_scores = model(inputs)
+print(tag_scores)
+
+for epoch in range(300):
+    for sentence, tags in training_data:
+        model.zero_grad()
+        model.hidden = model.init_hidden()
+        sentence_in = prepare_sequence(sentence, word_to_ix)
+        targets = prepare_sequence(tags, tags_to_ix)
+
+        tag_scores = model(sentence_in)
+        loss = loss_function(tag_scores, targets)
+        loss.backward()
+        optimizer.step()
+
+inputs = prepare_sequence(training_data[0][0], word_to_ix)
+tag_scores = model(inputs)
+print(tag_scores)
+
+
+#+END_SRC
+
+
+
+** DONE Get ipython3 to work in emacs
+- For some bizarre reason it loads ipython2 from emacs, but jupyter console from shell loads python3.
+- Potentially zsh config is correct, but emacs doesn't pick up on this?
+- Tried exec-path but that doesn't appear to have worked
+
+
+** COMMENT Text Data
+
+- We also have a bunch of text data available, describing the listing. We could toss this into some kind of RNN and see what happens.
+
+#+BEGIN_SRC python
+
+words = set() #{} creates a dictionary
+for each in text:
+         each = str(each).lower()
+         for word in each.split():
+             if word not in words:
+                 words.add(word)
+             else:
+                 pass
+#+END_SRC
+
+#+BEGIN_SRC python
+def count_words(text):
+    wordcounts = {}
+    for each in text:
+        each = str(each).strip().lower()
+        for word in each.split():
+            if word not in wordcounts:
+                wordcounts[word] = 1
+            else:
+                wordcounts[word] += 1
+        return wordcounts
+
+#+END_SRC
+
+#+BEGIN_SRC python :session
+listings =[]
+interest_level =[]
+text =[]
+lines =[]
+rentals = open('rentals_text_data.csv')
+for i, each in enumerate(rentals):
+         if i<20:
+             lines.append(each)
+
+
+
+wordcounts = {}
+data =[]
+fulldata = open('rentals_text_data.csv').read()
+with open('rentals_text_data.csv') as textfile:
+    myreader = csv.reader(textfile, delimiter=',')
+    for line in myreader:
+       data.append(line)
+        for each in text:
+            each = str(each).strip().lower()
+            for word in each.split():
+                if word not in wordcounts:
+                    wordcounts[word] = 1
+                else:
+                    wordcounts[word] += 1
+import pandas as pd
+df = pd.DataFrame.from_records(data)
+#+END_SRC
+
+- So I can open the file, but the text is hard to deal with
+- I solved this by outputting only the text data to a file
+- Creating a dataframe seems easier, after looking at some of the other methods.
+
+
+#+BEGIN_SRC python
+textdata = []
+with open('rentals_sample_text_only.csv') as file:
+    for line in file:
+        textdata.append(line)
+        # try:
+        #     textdata.append(line)
+        # except Exception:
+        #     pass
+        # finally:
+        #     file.close()
+wordcounts = {}
+charcounts = {}
+for each in textdata:
+    each = str(each).strip().lower()
+    for word in each.split():
+        if word not in wordcounts:
+            wordcounts[word] = 1
+        else:
+            wordcounts[word] += 1
+
+for each in textdata:
+    each = str(each).strip().lower()
+    for word in each.split():
+        for char in list(word):
+            if char not in charcounts:
+                charcounts[char] = 1
+            else:
+                charcounts[char] += 1
+
+
+word_to_ix = {}
+
+for word in wordcounts:
+    if word not in word_to_ix:
+        word_to_ix[word] = len(word_to_ix)
+
+
+#+END_SRC
+
+
+
+With this code (which again, was pretty easy to just write at a REPL and paste in), I can get the necessary information for building a word model to predict out interest level
+
+- Words are going to be really sparse
+- There seems to be a lot of work on using characters
+- The character is mapped to a bit vector of 1*N(char)
+- Words are matrices made up of characters
+- Presumably the same sort of thing could be done with sentences
+- Normally, one trains an RNN over some 1d convolutions and use this to predict
+- the RNN can handle variable length inputs
+- Characters are going to be way better (dim 93) vs words (dim 31k)
+- My net should take as input a set of 39*length(word) matrices which represent the sentence
+- Ah yeah, that's why the RNN is necessary, to account for the differing lengths of sentences. In fact, each entry may consist of multiple sentences.
+- Do we even need to account for this structure?
+
+#+BEGIN_SRC python :session
+import unicodedata
+import string
+
+all_letters = string.ascii_letters + " .,;'"
+n_letters = len(all_letters)
+
+def unicode_to_ascii(s):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+        and c in all_letters
+    )
+first = text['description']
+test = first.iloc[0]
+first2 = []
+char_ascii = {}
+for line in first:
+    for char in word:
+        char = unicodeToAscii(char.lower())
+        if char not in char_ascii:
+            char_ascii[char] = 1
+        else:
+            pass
+
+
+
+
+
+            first_ascii.append(unicodeToAscii(each))
+
+#+END_SRC
+
+- the ASCIIization only reduces the number of characters to 36, so not sure its worthwhile.
+
+#+BEGIN_SRC python
+import torch
+all_letters = charcounts.keys()
+letter_idx ={}
+for letter in all_letters:
+    if letter not in letter_idx:
+        letter_idx[letter] = len(letter_idx)
+
+
+def letter_to_index(letter):
+    return letter_idx[letter]
+
+def letter_to_tensor(letter):
+    tensor = torch.zeros(1, len(charcounts))
+    tensor[0][letter_to_index(letter)] = 1
+    return tensor
+
+def line_to_tensor(line):
+    tensor = torch.zeros(len(line), 1, len(charcounts))
+    for li, letter in enumerate(line):
+        tensor[li][0][letter_to_index(letter)] = 1
+    return tensor
+
+print(letter_to_tensor('j'))
+print(line_to_tensor('jones').size())
+#+END_SRC
+
+#+BEGIN_SRC python
+import torch.nn as nn
+from torch.autograd import Variable
+
+class RNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(RNN, self).__init__()
+        self.hidden_size = hidden_size
+        self.i2h = nn.Linear(input_size + hidden_size, hidden_size)
+        self.i2o = nn.Linear(input_size + hidden_size, output_size)
+
+    def forward(self, input, hidden):
+        combined = torch.cat((input, hidden), 1)
+        hidden = self.i2h(combined)
+        output = self.i2o(combined)
+        return output, hidden
+
+    def init_hidden(self):
+        return Variable(torch.zeros(1, self.hidden_size))
+
+n_hidden = 128
+n_letters = len(char_ascii)
+rnn = RNN(len(char_ascii), n_hidden, 3)
+#+END_SRC
+
+- OK, this one is working now.
+- I actually have 93 chars, but will stick with it for the time being.
+- I'll reduce later and see what it does to performance
+
+#+BEGIN_SRC python
+all_categories = ['low', 'medium', 'high']
+def category_from_output(output):
+    top_n, top_i = output.data.topk(1)
+    category_i = top_i[0][0]
+    return all_categories[category_i], category_i
+
+#+END_SRC
+
+
+- We also need to be able to randomly select a training example.
+
+#+BEGIN_SRC python
+import pandas as pd
+#nas make torch cry
+textdf = pd.read_csv('rentals_text_data.csv').dropna(axis=0)
+cat_to_ix = {}
+for cat in all_categories:
+    if cat not in cat_to_ix:
+        cat_to_ix[cat] = len(cat_to_ix)
+    else:
+        pass
+
+def random_row(df):
+    rowrange = df.shape[0] -1
+    rrow = random.randint(0, rowrange)
+    return (df.iloc[rrow,:], rrow)
+
+def random_training_example(df):
+    rrow = random_row(df)
+    row = rrow[0]
+    numrow = rrow[1]
+    target = row['interest_level']
+    text = row['description']
+    catlen = len(all_categories)
+    target_tensor = Variable(torch.zeros(catlen))
+    idx_cat = cat_to_ix[target]
+    target_tensor[idx_cat]  = 1
+    words_tensor = Variable(line_to_tensor(text))
+    return target, text, target_tensor, words_tensor, numrow
+
+
+target, text, target_tensor, words_tensor, numrow = random_training_example(textdf)
+#+END_SRC
+
+
+- Next, we need a loss function.
+
+#+BEGIN_SRC python
+criterion = nn.CrossEntropyLoss()
+#+END_SRC
+
+
+- We need to loop over each letter, updating the hidden state as we go.
+- We then compare final output to target
+- Backpropagate
+- Return output and loss
+
+#+BEGIN_SRC python
+# for i in range(w_tensor.size()[0]):
+#     output, hidden = rnn(w_tensor[i], hidden)
+
+learning_rate = 0.005
+import torch.nn as nn
+def train(target_tensor, words_tensor):
+    hidden = rnn.init_hidden()
+    rnn.zero_grad()
+    for i in range(words_tensor.size()[0]):
+        output, hidden = rnn(words_tensor[i], hidden)
+    print(output)
+    loss = criterion(output.squeeze(), target_tensor.type(torch.LongTensor))
+    loss.backward() #magic
+
+    for p in rnn.parameters():
+        #need to figure out why this is necessary
+        p.data.add_(-learning_rate, p.grad.data)
+
+    return output, loss.data[0]
+
+missing = 0
+for x in descs:
+    if not x:
+        missing+= 1
+
+#+END_SRC
+
+
+#+BEGIN_SRC python :session
+import time
+import math
+def time_since(since):
+    now = time.time()
+    s = now - since
+    m = math.floor(s / 60)
+    s -= m * 60
+    return '%dm %ds' % (m, s)
+
+n_iters = 10000
+print_every = 500
+plot_every = 1000
+current_loss = 0
+all_losses = []
+start = time.time()
+for iter in range(1, n_iters + 1):
+    category, line, category_tensor, line_tensor, numrow = random_training_example(textdf)
+    try:
+        output, loss = train(category_tensor, line_tensor)
+        current_loss += loss
+
+    except:
+        pass
+
+
+    # Print iter number, loss, name and guess
+    if iter % print_every == 0:
+        guess, guess_i = category_from_output(output)
+        correct = '✓' if guess == category else '✗ (%s)' % category
+        print('%d %d%% (%s) %.4f %s / %s %s' % (iter, iter / n_iters * 100, time_since(start), loss, line, guess, correct))
+
+    # Add current loss avg to list of losses
+    if iter % plot_every == 0:
+        all_losses.append(current_loss / plot_every)
+        current_loss = 0
+
+#+END_SRC
+
+#+BEGIN_SRC python :session
+float_ind = []
+for i, text in enumerate(desc):
+    if isinstance(text, float):
+        float_ind.append(i)
+
+#+END_SRC
+
+#+BEGIN_SRC python
+class LSTMRentals(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, vocab_size, class_size):
+        super(LSTMTagger, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        #lstm takes word embeddings as inputs and outputs hidden states
+        #with dimensionality hidden_dim
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim)
+        self.hidden2tag = nn.Linear(hidden_dim, class_size)
+        self.hidden = self.init_hidden()
+
+    def init_hidden(self):
+    #state doesn't exist before we do anything
+    #docs explain this more
+    #axes semantics are (num_layers, minibatch_size, hidden_dim)
+    return (autograd.Variable(torch.zeros(1, 1, self.hidden_dim)),
+            autograd.Variable(torch.zeros(1, 1, self.hidden_dim)))
+
+    def forward(self, sentence):
+        embeds = self.word_embeddings(sentence)
+        lstm_out, self.hidden = self.lstm(
+            embeds.view(len(sentence), 1, -1),
+            self.hidden)
+        tag_space - self.hidden2tag(lstm_out.view(len(sentence) -1))
+        tag_scores = F.log_softmax(tag_space)
+        return tag_scores
+
+model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix))
+loss_function = nn.NLLLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.1)
+#+END_SRC
+
+** Checking Image Means
+
+#+BEGIN_SRC python
+means = torch.zeros([1, 3, 128, 128])
+for data in tr:
+    inputs, labels = data
+    means = torch.cat((means, inputs.mean(dim=0)))
+
+
+#+END_SRC
+
+* Blurb
+
+PyTorch is a GPU matrix library for Python. Based on the ideas (and C code) for Torch, a lua environment for scientific computation, it combines speed of execution with an elegant programming framework for computation on the GPU
+- Pytorch has specialised modules for automatic differentiation and neural networks
+- In this talk we will:
+  - Introduce the core library and concepts behind PyTorch
+  - Cover simple linear models with PyTorch
+  - Fit some (relatively) simple neural networks on image data
+  - Fit some LSTM's to text data
+  - Examine the performance relative to traditional approaches
+  - We will use samples from the Kaggle [[https://www.kaggle.com/c/two-sigma-connect-rental-listing-inquiries][rentals]] competition
+  - Specifically, a sample of images obtained during the course of my [[https://www.meetup.com/DublinR/events/239190623/][last talk]]
+** PyTorch DataLoading Tutorial
+#+BEGIN_SRC python
+from torch.utils.data import Dataset, DataLoader
+class RentalsDataSet(Dataset):
+    def __init__(self, dfile, image_dir, sample):
+        """
+        Args:
+        csv_file: file with the standard image names and classes
+        image_dir: root of image folders
+        sample: a csvfile of listing_ids for which we have images"""
+        datafile = pd.read_json(dfile)
+        self.image_dir = image_dir
+        self.sample = pd.read_csv(sample)
+        self.sample_file = pd.merge(self.sample, datafile, on='listing_id')
+    def __len__(self):
+        photo_urls = self.sample_file['photos']
+        return sum([len(x) for x in photo_urls])
+    def __getitem__(self, idx):
+
+#+END_SRC
+
+#+BEGIN_SRC python :session
+from skimage import io, transform
+from torch.utils.data import Dataset, DataLoader
+class RentalsDataSetOriginal(Dataset):
+    def __init__(self, csv_file, image_path, transform):
+        self.data_file = pd.read_csv(csv_file)
+        self.image_dir = image_path
+        if transform:
+            self.transform = transform
+
+    def __len__(self):
+        return len(self.data_file)
+
+
+#+END_SRC
+
+#+BEGIN_SRC python :session
+all_im = pd.read_csv('all_images.csv')
+first = all_im.iloc[0,:]
+dclass, listing, im, split = first
+os.path.join(data_dir, split, dclass, im)
+os.listdir('new_photos/train/low')
+from scipy import misc
+test_im = misc.imread(os.path.join(data_dir, split, dclass, im))
+#+END_SRC
+
+#+BEGIN_SRC python :session
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+from skimage import io
+
+rent_data_trans = RentalsDataSetOriginal('all_images.csv', 'new_photos',None)
+                                         # transform=transform.Compose([
+        # transforms.CenterCrop(128),
+        # transforms.ToTensor(),
+        # transforms.Normalize(
+        #     (0.5, 0.5, 0.5),
+        #     (0.5, 0.5, 0.5))]))
+#+END_SRC
+- transforms don't work without a __call__ method
+- this is annoying, but hey i get to learn more about python dunder methods (which may be the coolest thing about Python)
+
+
+#+BEGIN_SRC python :session
+import matplotlib.pyplot as plt
+def show_image(img):
+    img = img.numpy()
+    c, h, w = img.shape
+    img2 = img.reshape([h, w, c])
+    plt.imshow(img2)
+
+for i in range(len(rent_data_trans)):
+    sample = rent_data_trans[i]
+    print(i, sample[0].size(), sample[1])
+    ax = plt.subplot(1, 4, i + 1)
+    plt.tight_layout()
+    ax.set_title('{}, class:{}'.format(i, sample[1]))
+    ax.axis('off')
+    show_image(sample[0])
+
+    if i == 3:
+        plt.show()
+        break
+#+END_SRC
+
+#+BEGIN_SRC python :session
+loader = DataLoader(rent_data_trans,batch_size=6, shuffle=True, num_workers=2 )
+inputs, labels = next(iter(loader))
+#+END_SRC
